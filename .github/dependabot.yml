@@ -1,0 +1,25 @@
+# Dependabot covers what it knows how to read: workflow actions and the base
+# image of a Dockerfile. It does not read CMake's FetchContent tags or the apt
+# versions pinned inside a RUN layer, which is why
+# .github/workflows/dependency-freshness.yml exists alongside it.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci
+
+  - package-ecosystem: docker
+    directory: /.devcontainer
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: build
+    ignore:
+      # Moving to another Ubuntu release means changing UBUNTU_CODENAME and
+      # CMAKE_VERSION in the same edit: the apt archives and the pinned package
+      # version both name the release. That is a deliberate change rather than a
+      # bump, so it is made by hand instead of proposed every week.
+      - dependency-name: ubuntu

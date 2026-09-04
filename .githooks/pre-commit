@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+#
+# Runs the checks CI runs, on the files being committed, before the commit
+# exists. Not to be strict: to move a failure from ten minutes away to one
+# second away.
+#
+# Every check is skipped, loudly, when its tool is missing. A hook that stops
+# somebody from committing because they have not installed clang-format is a
+# hook they will delete. The dev container has all of them.
+#
+# To bypass it once: git commit --no-verify
+#
+# Installed by scripts/install-hooks.sh, which points core.hooksPath here. Git
+# does not enable hooks on clone, so that command is the one manual step.
+
+set -uo pipefail
+
+status=0
+skipped=()
+
+note() { printf '%s\n' "$*" >&2; }
+fail() { note "  $*"; status=1; }
+
+mapfile -t staged < <(git diff --cached --name-only --diff-filter=ACMR)
+[ ${#staged[@]} -gt 0 ] || exit 0
+
+# Which files a checker applies to is not written here. scripts/lint-paths.sh
+# answers that, and the CI job asks the same script, so the two cannot come to
+# disagree about an extension - which they had, over .h and .cc, with the hook
+# checking more than CI did. This narrows that answer to what is being
+# committed; CI takes it whole.
+readonly paths=scripts/lint-paths.sh
+if [ ! -x "$paths" ]; then
+    note "$paths is missing or not executable, so this hook cannot tell which"
+    note "files to check. Refusing rather than checking nothing."
+    exit 1
+fi
+
+for_check() {
+    comm -12 \
+        <(printf '%s\n' "${staged[@]}" | sort -u) \
+        <("$paths" "$1" | sort -u)
+}
+
+# --- formatting -----------------------------------------------------------
+# Reads the staged content rather than the file on disk, so that a half-staged
+# file is judged by what is actually going into the commit.
+mapfile -t sources < <(for_check clang-format)
+if [ ${#sources[@]} -gt 0 ]; then
+    if command -v clang-format > /dev/null 2>&1; then
+        note "clang-format: ${#sources[@]} file(s)"
+        for f in "${sources[@]}"; do
+            if ! git show ":$f" \
+                | clang-format --assume-filename="$f" --dry-run --Werror 2>&1 \
+                | sed "s|^<stdin>|$f|"; then
+                fail "$f is not formatted; run: clang-format -i $f"
+            fi
+        done
+    else
+        skipped+=("clang-format")
+    fi
+fi
+
+# --- static analysis ------------------------------------------------------
+# Needs a configured build: clang-tidy has to know how each file is compiled.
+# The tidy preset specifically, and not whichever build directory happens to
+# exist - clang-tidy reads the flags out of the build, and given a GCC one it
+# fails every file on warning names clang has never had. Nothing to be strict
+# about until that build exists, so the check disappears instead of complaining:
+#
+#   cmake --preset tidy
+db=build/tidy/compile_commands.json
+mapfile -t translation_units < <(for_check clang-tidy)
+if [ ${#translation_units[@]} -gt 0 ] && [ -f "$db" ]; then
+    if command -v clang-tidy > /dev/null 2>&1; then
+        dir=$(dirname "$db")
+        for f in "${translation_units[@]}"; do
+            grep -qF "$PWD/$f" "$db" || continue
+            note "clang-tidy: $f"
+            clang-tidy -p "$dir" --warnings-as-errors='*' --quiet "$f" \
+                || fail "$f has clang-tidy findings"
+        done
+    else
+        skipped+=("clang-tidy")
+    fi
+fi
+
+# --- workflows ------------------------------------------------------------
+# Checked on disk: actionlint resolves .github/actionlint.yml relative to the
+# working tree, and shellcheck follows the same convention for the scripts.
+mapfile -t workflows < <(for_check actionlint)
+if [ ${#workflows[@]} -gt 0 ]; then
+    if command -v actionlint > /dev/null 2>&1; then
+        note "actionlint: ${#workflows[@]} file(s)"
+        actionlint "${workflows[@]}" || fail "actionlint reported problems"
+    else
+        skipped+=("actionlint")
+    fi
+fi
+
+# --- the reasons for the lint configuration -------------------------------
+mapfile -t tidy_config < <(for_check tidy-rationale)
+if [ ${#tidy_config[@]} -gt 0 ] && [ -x scripts/check-tidy-rationale.sh ]; then
+    note "check-tidy-rationale"
+    scripts/check-tidy-rationale.sh > /dev/null \
+        || fail "a check is switched off in .clang-tidy without a reason in docs/coding-style.md"
+fi
+
+# --- container images -----------------------------------------------------
+mapfile -t dockerfiles < <(for_check hadolint)
+if [ ${#dockerfiles[@]} -gt 0 ]; then
+    if command -v hadolint > /dev/null 2>&1; then
+        note "hadolint: ${#dockerfiles[@]} file(s)"
+        hadolint "${dockerfiles[@]}" || fail "hadolint reported problems"
+    else
+        skipped+=("hadolint")
+    fi
+fi
+
+# --- shell ----------------------------------------------------------------
+mapfile -t shell_scripts < <(for_check shellcheck)
+if [ ${#shell_scripts[@]} -gt 0 ]; then
+    if command -v shellcheck > /dev/null 2>&1; then
+        note "shellcheck: ${#shell_scripts[@]} file(s)"
+        shellcheck "${shell_scripts[@]}" || fail "shellcheck reported problems"
+    else
+        skipped+=("shellcheck")
+    fi
+fi
+
+if [ ${#skipped[@]} -gt 0 ]; then
+    note "not installed, so not checked: ${skipped[*]}"
+fi
+
+if [ $status -ne 0 ]; then
+    note ""
+    note "Commit refused. Fix the above, or commit with --no-verify."
+fi
+
+exit $status

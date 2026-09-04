@@ -1,0 +1,208 @@
+# Guards against pins quietly going stale.
+#
+# Dependabot reads workflow actions and Dockerfile base images. It does not read
+# CMake's FetchContent tags, nor apt versions pinned inside a RUN layer, so
+# those would sit at whatever version they were written at until somebody
+# noticed by hand. This job notices instead, and opens an issue.
+#
+# It watches the pins this project started with, and only those. It is a
+# starting point in the same way the rest of the template is: a dependency you
+# add is a dependency you add a check for, next to the ones below.
+name: dependency freshness
+
+on:
+  schedule:
+    - cron: "0 20 * * 1" # Mondays, 20:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+# `shell: bash` is not the shell a run step gets by default. The default is
+# `bash -e`; naming it explicitly gets `bash -eo pipefail`, so a command that
+# fails on the left of a pipe fails the step instead of being overwritten by
+# whatever came after it. Set once for the workflow rather than per step,
+# because the flags belong to the shell, not to whichever commands happen to be
+# in it today - a step added next month gets them without anybody remembering.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compare pins against what is current
+        id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          stale=""
+
+          note() {
+            stale="${stale}- **$1**: pinned \`$2\`, current \`$3\`"$'\n'
+          }
+
+          # --- GoogleTest: fetched by tag, invisible to Dependabot ---
+          gtest_pinned=$(grep -oP 'CPPBP_GOOGLETEST_TAG "\K[^"]+' cmake/modules/TestDependencies.cmake)
+          gtest_current=$(gh api repos/google/googletest/releases \
+            --jq '[.[] | select(.prerelease == false) | .tag_name][0]')
+          [ "$gtest_pinned" = "$gtest_current" ] || note GoogleTest "$gtest_pinned" "$gtest_current"
+
+          # --- CLI11: declared in the shared modules, linked by some projects ---
+          # Checked by what links it rather than by what declares it: the
+          # declaration travels with the shared CMake modules, and a project
+          # that never links CLI11 does not have a CLI11 problem.
+          if grep -rqF "CLI11::CLI11" --include=CMakeLists.txt .; then
+            cli11_pinned=$(grep -oP 'CPPBP_CLI11_TAG "\K[^"]+' cmake/modules/CommandLineDependencies.cmake)
+            cli11_current=$(gh api repos/CLIUtils/CLI11/releases \
+              --jq '[.[] | select(.prerelease == false) | .tag_name][0]')
+            [ "$cli11_pinned" = "$cli11_current" ] || note CLI11 "$cli11_pinned" "$cli11_current"
+          else
+            echo "Nothing links CLI11::CLI11 here, so its pin is not this project's problem."
+          fi
+
+          # --- actionlint: a release binary, so neither apt nor Dependabot sees it ---
+          actionlint_pinned=$(grep -oP 'ARG ACTIONLINT_VERSION=\K.*' .devcontainer/Dockerfile)
+          actionlint_current=$(gh api repos/rhysd/actionlint/releases \
+            --jq '[.[] | select(.prerelease == false) | .tag_name][0]' | sed 's/^v//')
+          [ "$actionlint_pinned" = "$actionlint_current" ] \
+            || note actionlint "$actionlint_pinned" "$actionlint_current"
+
+          # --- hadolint: the same, and for the same reason ---
+          hadolint_pinned=$(grep -oP 'ARG HADOLINT_VERSION=\K.*' .devcontainer/Dockerfile)
+          hadolint_current=$(gh api repos/hadolint/hadolint/releases \
+            --jq '[.[] | select(.prerelease == false) | .tag_name][0]' | sed 's/^v//')
+          [ "$hadolint_pinned" = "$hadolint_current" ] \
+            || note hadolint "$hadolint_pinned" "$hadolint_current"
+
+          # --- apt pins inside the image: ask the repositories themselves ---
+          #
+          # The image, the release it is built on and the versions pinned in it
+          # are all read out of the Dockerfile rather than written here. A probe
+          # naming its own release goes on answering about the one before the
+          # last bump, and answers confidently.
+          cmake_pinned=$(grep -oP 'ARG CMAKE_VERSION=\K.*' .devcontainer/Dockerfile)
+          clang_pinned=$(grep -oP 'ARG CLANG_VERSION=\K.*' .devcontainer/Dockerfile)
+          gcc_pinned=$(grep -oP 'ARG GCC_VERSION=\K.*' .devcontainer/Dockerfile)
+          codename=$(grep -oP 'ARG UBUNTU_CODENAME=\K.*' .devcontainer/Dockerfile)
+          base=$(grep -oP '^FROM \K\S+' .devcontainer/Dockerfile)
+
+          # The probe's failure is this job's failure. A fallback that answered
+          # with the pinned version when the probe could not run would make
+          # every apt pin compare equal to itself - three checks that could only
+          # ever report "current", in the job that exists to notice when they
+          # are not.
+          docker run --rm -e DEBIAN_FRONTEND=noninteractive \
+            -e CLANG_PINNED="$clang_pinned" -e CODENAME="$codename" "$base" \
+            bash -euo pipefail -c '
+            apt-get update -qq > /dev/null
+            apt-get install -y -qq curl gpg ca-certificates > /dev/null
+
+            curl -fsSL https://apt.kitware.com/keys/kitware-archive-latest.asc \
+              | gpg --dearmor -o /usr/share/keyrings/k.gpg
+            echo "deb [signed-by=/usr/share/keyrings/k.gpg] https://apt.kitware.com/ubuntu/ ${CODENAME} main" \
+              > /etc/apt/sources.list.d/kitware.list
+
+            curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+              | gpg --dearmor -o /usr/share/keyrings/l.gpg
+
+            # apt.llvm.org carries one suite per major version and nothing for
+            # the ones after it, and apt fails an entire update over a single
+            # suite it cannot fetch - so a list of versions written ahead of the
+            # pin takes the whole probe down as soon as one of them is not there
+            # yet. They are asked for before they are written instead, and the
+            # three answers are kept apart: one that is there is used, the first
+            # one that is not ends the search, and anything else is a question
+            # that went unanswered rather than a version that is not out.
+            #
+            # A suite appears when the release branches, not when it ships -
+            # llvm-toolchain-noble-23 was serving 23.1.0~++20260818 a week
+            # before 23.1.0 came out - and nothing in the apt metadata tells the
+            # two apart, so the newest suite found here can be a release
+            # candidate, and the issue this job opens can name it.
+            suites=0
+            for v in $(seq "$CLANG_PINNED" $((CLANG_PINNED + 9))); do
+              url="http://apt.llvm.org/${CODENAME}/dists/llvm-toolchain-${CODENAME}-${v}/Release"
+              status=$(curl -sSL -o /dev/null -w "%{http_code}" "$url")
+              case "$status" in
+                200) ;;
+                404) break ;;
+                *) echo "apt.llvm.org answered ${status} for ${url}" >&2; exit 1 ;;
+              esac
+              echo "deb [signed-by=/usr/share/keyrings/l.gpg] http://apt.llvm.org/${CODENAME}/ llvm-toolchain-${CODENAME}-${v} main"
+              suites=$((suites + 1))
+            done > /etc/apt/sources.list.d/llvm.list
+            [ "$suites" -gt 0 ] || {
+              echo "apt.llvm.org has no suite for ${CODENAME}-${CLANG_PINNED}, which is the one the image installs" >&2
+              exit 1
+            }
+            # Ten wide, and reaching the end of it is a failure rather than an
+            # answer: every suite in the window existing means the newest one is
+            # somewhere past it, and the version reported below would be the
+            # last one looked at rather than the current one.
+            [ "$suites" -lt 10 ] || {
+              echo "every suite from ${CLANG_PINNED} to $((CLANG_PINNED + 9)) exists; the newest is past the end of the search" >&2
+              exit 1
+            }
+
+            apt-get update -qq > /dev/null
+            echo "cmake=$(apt-cache policy cmake | awk "/Candidate:/ {print \$2}")"
+            echo "clang=$(apt-cache search --names-only "^clang-[0-9]+$" | grep -oP "clang-\K[0-9]+" | sort -n | tail -1)"
+            echo "gcc=$(apt-cache search --names-only "^g\+\+-[0-9]+$" | grep -oP "g\+\+-\K[0-9]+" | sort -n | tail -1)"
+          ' > "$RUNNER_TEMP/current.txt"
+
+          # No fallback here either: a version the probe could not read is not a
+          # version that is current.
+          cmake_current=$(sed -n 's/^cmake=//p' "$RUNNER_TEMP/current.txt")
+          clang_current=$(sed -n 's/^clang=//p' "$RUNNER_TEMP/current.txt")
+          gcc_current=$(sed -n 's/^gcc=//p' "$RUNNER_TEMP/current.txt")
+          for answer in "$cmake_current" "$clang_current" "$gcc_current"; do
+            [ -n "$answer" ] || {
+              echo "::error::the probe did not report every version; see the step log"
+              exit 1
+            }
+          done
+
+          [ "$cmake_pinned" = "$cmake_current" ] || note CMake "$cmake_pinned" "$cmake_current"
+          [ "$clang_pinned" = "$clang_current" ] || note Clang "$clang_pinned" "$clang_current"
+          [ "$gcc_pinned" = "$gcc_current" ] || note GCC "$gcc_pinned" "$gcc_current"
+
+          {
+            echo "stale<<STALE_EOF"
+            printf '%s' "$stale"
+            echo "STALE_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -n "$stale" ]; then
+            echo "Behind:"; printf '%s' "$stale"
+          else
+            echo "Everything is current."
+          fi
+
+      # One open issue at a time: a weekly job that opens a new issue every week
+      # trains everyone to ignore the label.
+      #
+      # STALE goes through env:. A ${{ }} expansion is pasted in before bash
+      # reads the line, and the backticks in the list would run as commands.
+      - name: Open or update an issue
+        if: steps.compare.outputs.stale != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STALE: ${{ steps.compare.outputs.stale }}
+        run: |
+          set -euo pipefail
+          title="Dependencies are behind"
+          # \n\n: the list ends without a newline of its own.
+          body=$(printf 'These pins are behind what is currently published.\n\n%s\n\nThis issue is updated by the dependency-freshness workflow, which watches the pins this project was started with. It is not a to-do list with a deadline, and being behind is not the same as being broken.\n' "$STALE")
+
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

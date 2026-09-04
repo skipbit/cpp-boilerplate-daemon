@@ -1,0 +1,477 @@
+# Reusable: everything that has to hold before a change is allowed in.
+#
+# Four kinds of job, because there are four different questions:
+#
+#   native          - does this build with what people actually have? Ubuntu's
+#                     own compilers and CMake, no extra repositories.
+#   pinned          - does this build in a fixed environment? Versions are
+#                     frozen in .devcontainer/Dockerfile, which the dev
+#                     container also uses, so a failure here is a real change
+#                     and never a surprise upgrade.
+#   shared-libs     - what does BUILD_SHARED_LIBS=ON build and install? Every
+#                     other job leaves it off, which is the default.
+#   static-analysis - does it pass clang-tidy and clang-format? In the pinned
+#                     image, so that everyone is arguing with the same version.
+#
+# And one job before them that builds nothing: it asks the project which native
+# rows it has. Not every project has all of them, and a row a project cannot
+# build has to be one that is not there rather than one that is empty.
+name: build and test
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# `shell: bash` is not the shell a run step gets by default. The default is
+# `bash -e`; naming it explicitly gets `bash -eo pipefail`, so a command that
+# fails on the left of a pipe fails the step instead of being overwritten by
+# whatever came after it. Set once for the workflow rather than per step,
+# because the flags belong to the shell, not to whichever commands happen to be
+# in it today - a step added next month gets them without anybody remembering.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # The native matrix below is not the same in every project, so it is asked
+  # for rather than written out.
+  #
+  # It was written out, with every step of a row the project cannot build
+  # carrying an `if:` and doing nothing. That reports success. Five skipped
+  # steps under a green tick beside "ubuntu-24.04 · clang++ · libc++" is, in
+  # the checks list, the same thing as a row that configured, compiled and
+  # tested - and it is the one claim this file must not make. `if:` on the job
+  # would grey the row out instead, and cannot: a job-level `if:` is evaluated
+  # where the `matrix` context does not exist, so it cannot ask which row it is.
+  #
+  # So a row that builds nothing is left out rather than emptied. Nothing that
+  # was being built stops being built; what stops is a green tick for a
+  # configuration nobody compiled. The rows that are left out are named in this
+  # job's summary, because a row that is not there cannot say so itself, and
+  # absent is only better than green while somebody can still see it.
+  project:
+    name: what this project can be built with
+    runs-on: ubuntu-24.04
+    outputs:
+      qt: ${{ steps.ask.outputs.qt }}
+      matrix: ${{ steps.ask.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # Asked of the project rather than written here, for the reason the SBOM
+      # option below is: this file is the same in every project that starts from
+      # a template, and what a particular one needs is in its CMakeLists.txt.
+      #
+      # Two questions. Does it use Qt, which has to be installed and is large
+      # enough that a project with no interface should not wait for it. Does it
+      # refuse libc++ - a project that links a Qt built against libstdc++ cannot
+      # be built against libc++ at all, so two of the rows below are not a
+      # failure it can fix. It says so at configure time; this reads the same
+      # declaration and does not ask.
+      - name: Ask the project what it can be built with
+        id: ask
+        run: |
+          # Listed one by one rather than as os × compiler: with a product, the
+          # entries overwrite the compiler for every os instead of multiplying,
+          # and the list silently shrinks to the last one.
+          #
+          # The standard library is a column because it decides more than the
+          # compiler does. clang against libstdc++ and clang against libc++ are
+          # two different sets of C++23, missing different things - and clang
+          # picks libstdc++ by default here, so a project that only builds the
+          # default has not checked the configuration its own escape hatch uses.
+          #
+          # Six rows rather than every possible combination: add one when you
+          # start caring about a platform this does not cover, and delete the
+          # rows for platforms you have decided not to support.
+          rows='[
+            {"os": "ubuntu-24.04", "cc": "gcc",   "cxx": "g++",     "stdlib": "libstdc++"},
+            {"os": "ubuntu-24.04", "cc": "clang", "cxx": "clang++", "stdlib": "libstdc++"},
+            {"os": "ubuntu-24.04", "cc": "clang", "cxx": "clang++", "stdlib": "libc++"},
+            {"os": "ubuntu-26.04", "cc": "gcc",   "cxx": "g++",     "stdlib": "libstdc++"},
+            {"os": "ubuntu-26.04", "cc": "clang", "cxx": "clang++", "stdlib": "libstdc++"},
+            {"os": "ubuntu-26.04", "cc": "clang", "cxx": "clang++", "stdlib": "libc++"}
+          ]'
+
+          qt=false
+          libcxx=true
+          if grep -q 'find_package(Qt6' CMakeLists.txt; then qt=true; fi
+          if grep -q 'CPPBP_STANDARD_LIBRARY STREQUAL "libc++"' CMakeLists.txt; then libcxx=false; fi
+
+          if [ "$libcxx" = false ]; then
+            echo "::notice::This project cannot be built against libc++ and says so in"\
+                 "CMakeLists.txt. It has no libc++ rows at all, rather than libc++ rows"\
+                 "that build nothing and report success. See the job summary."
+          fi
+
+          # Every row is in the summary, the ones that are built and the ones
+          # that are not. This is the only place the second kind is mentioned.
+          {
+            echo "Needs Qt: ${qt}"
+            echo
+            echo "| os | compiler | standard library | built |"
+            echo "| --- | --- | --- | --- |"
+            jq -r --argjson libcxx "$libcxx" '.[]
+              | "| \(.os) | \(.cxx) | \(.stdlib) | "
+                + (if $libcxx or .stdlib != "libc++"
+                   then "yes"
+                   else "no - this project refuses libc++" end)
+                + " |"' <<< "$rows"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          include=$(jq -c --argjson libcxx "$libcxx" \
+            '[.[] | select($libcxx or .stdlib != "libc++")]' <<< "$rows")
+
+          {
+            echo "qt=${qt}"
+            echo "matrix={\"include\": ${include}}"
+          } >> "$GITHUB_OUTPUT"
+
+  native:
+    name: ${{ matrix.os }} · ${{ matrix.cxx }} · ${{ matrix.stdlib }}
+    needs: project
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.project.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install ninja, and libc++ or Qt where they are wanted
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+          if [ "${{ matrix.stdlib }}" = "libc++" ]; then
+            sudo apt-get install -y --no-install-recommends libc++-dev libc++abi-dev
+          fi
+          # The qml6-module-* packages are the QML modules an interface imports
+          # at run time. On 24.04 nothing pulls them in, and a program that
+          # builds and links then fails to start.
+          if [ "${{ needs.project.outputs.qt }}" = "true" ]; then
+            sudo apt-get install -y --no-install-recommends \
+              qt6-base-dev \
+              qt6-declarative-dev \
+              qml6-module-qtqml \
+              qml6-module-qtqml-models \
+              qml6-module-qtqml-workerscript \
+              qml6-module-qtquick \
+              qml6-module-qtquick-controls \
+              qml6-module-qtquick-layouts \
+              qml6-module-qtquick-templates \
+              qml6-module-qtquick-window
+          fi
+
+      - name: Record what this job is actually building with
+        run: |
+          cmake --version | head -1
+          ${{ matrix.cxx }} --version | head -1
+
+      - name: Configure
+        run: |
+          flags=""
+          if [ "${{ matrix.stdlib }}" = "libc++" ]; then flags="-stdlib=libc++"; fi
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=${{ matrix.cc }} \
+            -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DCMAKE_CXX_FLAGS="$flags" \
+            -DCPPBP_WARNINGS_AS_ERRORS=ON
+
+      - name: Build
+        run: cmake --build build
+
+      # Runs the unit tests and, separately, installs the package and builds a
+      # project against it. The second one is what catches a broken install
+      # rule, which a passing unit test says nothing about.
+      #
+      # An interface draws, and a runner has no display. A test that needs this
+      # sets it itself so that running it by hand behaves the same way; it is
+      # here as well because a test added later might not.
+      #
+      # --no-tests=error, here and in the job below. Without it a run that found
+      # nothing to run is a pass: ctest says "No tests were found!!!" and exits
+      # 0, so a build whose tests have all disappeared is exactly as green as
+      # one whose tests all passed. The test presets in CMakePresets.json choose
+      # the other answer with noTestsAction; these lines do not go through a
+      # preset, so they say it themselves.
+      - name: Test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --test-dir build --output-on-failure --no-tests=error
+
+  pinned:
+    name: pinned toolchain
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the pinned image
+        uses: docker/build-push-action@v7
+        with:
+          context: .devcontainer
+          load: true
+          tags: toolchain:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # The SBOM is off by default and needs a CMake newer than any Ubuntu LTS
+      # ships, so this is the only place it is exercised. It is switched on here
+      # deliberately: the key that unlocks the experimental feature changes
+      # between CMake releases, and a changed key should be a failing job rather
+      # than a document that silently stopped being written.
+      #
+      # Which option switches it on is read out of CMakeLists.txt rather than
+      # written here. The option is named after the project, this file is the
+      # same in every project that starts from a template, and renaming one
+      # renames the option - so a name written here is wrong for everybody
+      # except the first. A project with no such option, because install(SBOM)
+      # cannot describe what it installs, is still built, tested and installed;
+      # there is simply nothing to look for afterwards.
+      - name: Build, test, and write an SBOM
+        run: |
+          sbom=$(grep -oE '[A-Za-z0-9_]+_GENERATE_SBOM' CMakeLists.txt | head -1 || true)
+          echo "SBOM option: ${sbom:-none declared in CMakeLists.txt}"
+          docker run --rm -v "$PWD":/src:ro -e SBOM="$sbom" toolchain:ci bash -euxo pipefail -c '
+            cmake --version | head -1
+            cmake -S /src -B /tmp/build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCPPBP_WARNINGS_AS_ERRORS=ON \
+              ${SBOM:+"-D${SBOM}=ON"}
+            cmake --build /tmp/build
+            ctest --test-dir /tmp/build --output-on-failure --no-tests=error
+            cmake --install /tmp/build --prefix /tmp/prefix
+            if [ -n "$SBOM" ]; then
+              find /tmp/prefix -name "*.spdx.json" -size +0c | grep -q .
+            fi
+          '
+
+  # Every job above leaves BUILD_SHARED_LIBS at its default, which is OFF. In a
+  # project that has an export header, hidden visibility or a SOVERSION, that
+  # makes the part of the CMakeLists.txt setting them up the part nothing has
+  # ever run.
+  #
+  # What that is worth was measured by deleting the export macro from one
+  # declaration in a public header. The static build passed every test. The
+  # shared build failed to link, from the program that consumes the installed
+  # package - the one place a hidden symbol shows up. Forgetting the macro on a
+  # new public function is the ordinary mistake in a library written this way.
+  #
+  # No condition on this job. BUILD_SHARED_LIBS=ON is a configuration, not a
+  # discovery: every project has it, so what it builds and installs is a
+  # question every project can answer. A project with no library to install
+  # answers "none", which is a result rather than an absence, and the job says
+  # so out loud below.
+  shared-libs:
+    name: what BUILD_SHARED_LIBS=ON builds and installs
+    needs: project
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # The qml6-module-* packages are the QML modules an interface imports at
+      # run time, for the reason the native rows install them: on 24.04 nothing
+      # pulls them in, and a program that builds and links then fails to start.
+      - name: Install ninja, and Qt where it is wanted
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+          if [ "${{ needs.project.outputs.qt }}" = "true" ]; then
+            sudo apt-get install -y --no-install-recommends \
+              qt6-base-dev \
+              qt6-declarative-dev \
+              qml6-module-qtqml \
+              qml6-module-qtqml-models \
+              qml6-module-qtqml-workerscript \
+              qml6-module-qtquick \
+              qml6-module-qtquick-controls \
+              qml6-module-qtquick-layouts \
+              qml6-module-qtquick-templates \
+              qml6-module-qtquick-window
+          fi
+
+      - name: Record what this job is actually building with
+        run: |
+          cmake --version | head -1
+          g++ --version | head -1
+
+      - name: Configure, build and test with BUILD_SHARED_LIBS=ON
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=ON \
+            -DCPPBP_WARNINGS_AS_ERRORS=ON
+          cmake --build build
+          ctest --test-dir build --output-on-failure --no-tests=error
+
+      # Read out of the install prefix rather than out of the build tree. The
+      # two differ by more than tidiness: a test framework fetched with
+      # FetchContent honours BUILD_SHARED_LIBS and leaves its own .so files in
+      # the build tree, so anything counted there is counting somebody else's
+      # libraries. The prefix holds what this project hands over.
+      #
+      # Three claims, all of them positive. Asserting that nothing was built is
+      # not among them: what a project installs is its own business, and a
+      # check that fails a project for installing a library it meant to install
+      # would be worse than no check.
+      - name: Read back what was installed
+        run: |
+          prefix="$RUNNER_TEMP/prefix"
+          cmake --install build --prefix "$prefix"
+
+          # (1) Installing nothing is a failure. A build that handed over
+          # nothing has checked nothing, and looks in the list exactly like one
+          # that checked everything - the reason the lint steps say the same.
+          mapfile -t installed < <(find "$prefix" -type f | sort)
+          if [ ${#installed[@]} -eq 0 ]; then
+            echo "::error::BUILD_SHARED_LIBS=ON installed nothing at all"
+            exit 1
+          fi
+          echo "installed ${#installed[@]} files"
+
+          # (2) docs/versioning.md says the installed library is
+          # lib<name>.so.<MAJOR>, so that something linked against one major
+          # version cannot silently load another. That is a property of the
+          # file, not of the build log: without a SONAME the loader falls back
+          # to the file name it was given, and the promise is not kept.
+          #
+          # The count is printed before the loop and whatever it is. Zero is the
+          # answer in a project that installs no library, and a green tick over
+          # a number nobody has seen is how "checked nothing" and "found nothing
+          # wrong" come to look the same.
+          mapfile -t libraries < <(
+            find "$prefix" \( -name '*.so' -o -name '*.so.*' \) -type f | sort)
+          echo "examined ${#libraries[@]} installed shared libraries"
+          for library in "${libraries[@]}"; do
+            soname=$(readelf -d "$library" | sed -n 's/.*SONAME.*\[\(.*\)\].*/\1/p')
+            name=${library#"$prefix"/}
+            echo "  $name -> ${soname:-no SONAME}"
+            if [[ ! $soname =~ \.so\.[0-9]+$ ]]; then
+              echo "::error::$name has no versioned SONAME (${soname:-none})"
+              exit 1
+            fi
+          done
+
+          # (3) Nothing installed asks the loader for a library that is not
+          # there. The prefix's own library directories are on the path, so
+          # this is about the closure of what was handed over: a program that
+          # needs a .so its own project built but did not install fails here,
+          # and so does one left pointing at a build-tree path.
+          libpath=$(find "$prefix" \( -name '*.so' -o -name '*.so.*' \) -type f \
+            -printf '%h\n' | sort -u | paste -sd: -)
+          checked=0
+          missing=0
+          for file in "${installed[@]}"; do
+            # ELF by its first four bytes rather than by asking `file`, whose
+            # wording is not a promise. A prefix holds headers, .cmake files and
+            # desktop entries too, and ldd has nothing to say about those.
+            [ "$(head -c 4 "$file" | od -An -tx1 | tr -d ' \n')" = "7f454c46" ] || continue
+            checked=$((checked + 1))
+            gone=$(LD_LIBRARY_PATH="$libpath" ldd "$file" 2>/dev/null \
+              | grep 'not found' || true)
+            if [ -n "$gone" ]; then
+              echo "::error::${file#"$prefix"/} asks for a library that is not there"
+              echo "$gone"
+              missing=$((missing + 1))
+            fi
+          done
+          echo "resolved the loader's needs for $checked installed ELF files"
+          [ "$missing" -eq 0 ]
+
+  static-analysis:
+    name: clang-tidy and clang-format
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the pinned image
+        uses: docker/build-push-action@v7
+        with:
+          context: .devcontainer
+          load: true
+          tags: toolchain:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # clang-tidy runs in the compile step, so a violation fails the build.
+      # Clang, not GCC: clang-tidy reads this build's flags, and GCC's own
+      # warning names would fail every file as unknown warning options.
+      # Fetched dependencies are not analysed - the module attaches clang-tidy
+      # per target - so the tests are built and checked here like everything
+      # else.
+      # An exclusion in .clang-tidy with no reason written down is how a lint
+      # configuration becomes untouchable. This makes that a build failure.
+      - name: Check that every disabled check is explained
+        run: ./scripts/check-tidy-rationale.sh
+
+      - name: Run clang-tidy as part of the build
+        run: |
+          docker run --rm -v "$PWD":/src:ro toolchain:ci bash -euxo pipefail -c '
+            cmake -S /src -B /tmp/tidy -G Ninja \
+              -DCMAKE_BUILD_TYPE=Debug \
+              -DCMAKE_C_COMPILER=clang \
+              -DCMAKE_CXX_COMPILER=clang++ \
+              -DCPPBP_ENABLE_CLANG_TIDY=ON
+            cmake --build /tmp/tidy
+          '
+
+      # Which files each of these three runs on comes from
+      # scripts/lint-paths.sh, which .githooks/pre-commit asks the same question
+      # of. One list, so the hook cannot check an extension this job does not -
+      # which it did, over .h and .cc, and a file could pass a commit that no
+      # job would ever have disagreed with.
+      #
+      # The list is worked out here rather than inside the container: it is read
+      # from the git index, and git inside a container refuses a bind mount it
+      # does not own as an unsafe repository.
+      #
+      # Matching nothing is a failure, not a pass. A check that silently has no
+      # work is indistinguishable from one that found none.
+      - name: Check formatting
+        run: |
+          mapfile -t files < <(./scripts/lint-paths.sh clang-format)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::no files matched"; exit 1; }
+          echo "clang-format: ${#files[@]} file(s)"
+          docker run --rm -v "$PWD":/src:ro toolchain:ci \
+            bash -euo pipefail -c 'cd /src && exec clang-format --dry-run --Werror "$@"' -- "${files[@]}"
+
+      # No `command -v` here. The hook skips a checker it cannot find, because a
+      # hook that blocks a commit over a missing tool is a hook people delete;
+      # a job that skips one is a job that reports nothing and looks the same as
+      # one that passed. Both are in the pinned image, and if they stop being
+      # there this has to fail.
+      - name: Check the shell scripts
+        run: |
+          mapfile -t files < <(./scripts/lint-paths.sh shellcheck)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::no files matched"; exit 1; }
+          echo "shellcheck: ${#files[@]} file(s)"
+          docker run --rm -v "$PWD":/src:ro toolchain:ci \
+            bash -euo pipefail -c 'cd /src && exec shellcheck "$@"' -- "${files[@]}"
+
+      # actionlint reads .github/actionlint.yml from the working directory, so
+      # this has to run with the repository as its cwd rather than by path.
+      - name: Check the workflows
+        run: |
+          mapfile -t files < <(./scripts/lint-paths.sh actionlint)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::no files matched"; exit 1; }
+          echo "actionlint: ${#files[@]} file(s)"
+          docker run --rm -v "$PWD":/src:ro toolchain:ci \
+            bash -euo pipefail -c 'cd /src && exec actionlint "$@"' -- "${files[@]}"
+
+      # hadolint reads .hadolint.yaml the same way, so it runs with the
+      # repository as its cwd too. One check is switched off in that file; the
+      # reason is in docs/toolchain.md and nowhere else.
+      - name: Check the Dockerfiles
+        run: |
+          mapfile -t files < <(./scripts/lint-paths.sh hadolint)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::no files matched"; exit 1; }
+          echo "hadolint: ${#files[@]} file(s)"
+          docker run --rm -v "$PWD":/src:ro toolchain:ci \
+            bash -euo pipefail -c 'cd /src && exec hadolint "$@"' -- "${files[@]}"

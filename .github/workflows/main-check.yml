@@ -1,0 +1,22 @@
+# Guards the claim that main is always in a state someone can start from.
+#
+# The same checks as pr-check, on purpose: a pull request can be merged while
+# another one lands underneath it, and neither pull request built the result.
+name: main check
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/build-and-test.yml
+
+  # The presets, which build-and-test.yml does not type: it sets the flags
+  # by hand so it can vary the compiler. Separate job, so a failure says which
+  # of the two is broken.
+  verify-presets:
+    uses: ./.github/workflows/preset-check.yml

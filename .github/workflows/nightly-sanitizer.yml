@@ -1,0 +1,61 @@
+# Guards against the bugs a compiler cannot see: use-after-free, undefined
+# behaviour, data races. These builds are slow, so they run overnight rather
+# than on every push.
+name: nightly sanitizer
+
+on:
+  schedule:
+    - cron: "0 18 * * *" # 18:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# `shell: bash` is not the shell a run step gets by default. The default is
+# `bash -e`; naming it explicitly gets `bash -eo pipefail`, so a command that
+# fails on the left of a pipe fails the step instead of being overwritten by
+# whatever came after it. Set once for the workflow rather than per step,
+# because the flags belong to the shell, not to whichever commands happen to be
+# in it today - a step added next month gets them without anybody remembering.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  sanitize:
+    # Named for what the job checks rather than for the preset it runs. The
+    # preset keeps its short name - it is what somebody types - but a run list
+    # is read, and every other job here says what it did in words.
+    name: ${{ matrix.checks }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      # address and thread cannot be combined, which is why they are separate
+      # jobs rather than one build with everything switched on.
+      matrix:
+        include:
+          - { preset: asan, checks: address and undefined behaviour }
+          - { preset: tsan, checks: data races }
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the pinned image
+        uses: docker/build-push-action@v7
+        with:
+          context: .devcontainer
+          load: true
+          tags: toolchain:ci
+          cache-from: type=gha
+
+      # Copied out of the read-only mount because the presets write their build
+      # directory next to the source.
+      - name: Build and test under the sanitizer
+        run: |
+          docker run --rm -v "$PWD":/src:ro toolchain:ci bash -euxo pipefail -c '
+            cp -r /src /work && cd /work
+            cmake --preset ${{ matrix.preset }}
+            cmake --build --preset ${{ matrix.preset }}
+            ctest --preset ${{ matrix.preset }}
+          '
