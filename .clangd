@@ -1,0 +1,10 @@
+# Which build clangd reads. Every build writes a compile database, but the
+# editor has to be told which one to believe, and the debug build is the one
+# configured with the warnings this project is developed under:
+#
+#   cmake --preset debug
+#
+# Without this, clangd looks for build/compile_commands.json - a path the preset
+# layout never creates - and falls back to guessing the flags.
+CompileFlags:
+  CompilationDatabase: build/debug

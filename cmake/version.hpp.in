@@ -1,0 +1,18 @@
+#pragma once
+
+// Generated from cmake/version.hpp.in. Do not edit.
+// The version is declared once, in project(... VERSION ...), and flows from
+// there into this header and into whatever --version prints. Bumping it in one
+// place is the whole point.
+
+#define MYDAEMON_VERSION_STRING "@PROJECT_VERSION@"
+
+namespace mydaemon {
+
+/// The version this program was built as, as a literal string.
+inline constexpr const char* version() noexcept
+{
+    return MYDAEMON_VERSION_STRING;
+}
+
+}  // namespace mydaemon

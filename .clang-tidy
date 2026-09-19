@@ -1,0 +1,172 @@
+---
+# What this file is for, and why each check is off, is written in
+# docs/coding-style.md. Every name in the exclusion list below has an entry
+# there; scripts/check-tidy-rationale.sh fails the build if one does not,
+# because an exclusion nobody can explain is one nobody dares to touch.
+#
+# YAML cannot hold a comment inside the folded scalar below - a '#' there is
+# literal text - which is why the reasons live in the document rather than
+# beside the lines.
+#
+# The list starts from -* and enables whole groups, so a check added by a newer
+# clang-tidy arrives switched on. That is deliberate: a new check is a new
+# question, and the build is where questions get asked.
+Checks: >
+  -*,
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  hicpp-*,
+  misc-*,
+  misc-definitions-in-headers,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  readability-redundant-declaration,
+  -bugprone-easily-swappable-parameters,
+  -cert-oop54-cpp,
+  -cppcoreguidelines-avoid-magic-numbers,
+  -readability-magic-numbers,
+  -cppcoreguidelines-macro-usage,
+  -cppcoreguidelines-non-private-member-variables-in-classes,
+  -misc-non-private-member-variables-in-classes,
+  -cppcoreguidelines-owning-memory,
+  -cppcoreguidelines-pro-bounds-array-to-pointer-decay,
+  -hicpp-no-array-decay,
+  -cppcoreguidelines-pro-bounds-constant-array-index,
+  -cppcoreguidelines-pro-bounds-pointer-arithmetic,
+  -cppcoreguidelines-pro-type-reinterpret-cast,
+  -cppcoreguidelines-pro-type-union-access,
+  -hicpp-multiway-paths-covered,
+  -misc-use-anonymous-namespace,
+  -modernize-use-trailing-return-type,
+  -portability-avoid-pragma-once,
+  -readability-function-cognitive-complexity,
+  -readability-identifier-length
+
+WarningsAsErrors: '*'
+
+# Options for the checks that are on. A threshold with no number written down
+# is a threshold nobody can argue with.
+CheckOptions:
+  # Naming conventions
+  - key: readability-identifier-naming.NamespaceCase
+    value: lower_case
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: lower_case
+  - key: readability-identifier-naming.MethodCase
+    value: lower_case
+  - key: readability-identifier-naming.VariableCase
+    value: lower_case
+  - key: readability-identifier-naming.ParameterCase
+    value: lower_case
+  - key: readability-identifier-naming.PublicMemberCase
+    value: lower_case
+  - key: readability-identifier-naming.PrivateMemberCase
+    value: lower_case
+  - key: readability-identifier-naming.PrivateMemberSuffix
+    value: '_'
+  - key: readability-identifier-naming.ProtectedMemberCase
+    value: lower_case
+  - key: readability-identifier-naming.ProtectedMemberSuffix
+    value: '_'
+  - key: readability-identifier-naming.EnumConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.ConstexprVariableCase
+    value: lower_case
+  - key: readability-identifier-naming.GlobalConstantCase
+    value: lower_case
+  - key: readability-identifier-naming.StaticConstantCase
+    value: lower_case
+  - key: readability-identifier-naming.TypeAliasCase
+    value: CamelCase
+  - key: readability-identifier-naming.TypedefCase
+    value: CamelCase
+  - key: readability-identifier-naming.TemplateParameterCase
+    value: CamelCase
+
+  # Modernize options
+  - key: modernize-use-nullptr.NullMacros
+    value: 'NULL'
+  - key: modernize-loop-convert.MaxCopySize
+    value: '16'
+  - key: modernize-loop-convert.MinConfidence
+    value: 'reasonable'
+  - key: modernize-use-default-member-init.UseAssignment
+    value: 'true'
+  - key: modernize-use-auto.RemoveStars
+    value: 'true'
+
+  # Performance options
+  - key: performance-for-range-copy.WarnOnAllAutoCopies
+    value: 'true'
+  - key: performance-inefficient-string-concatenation.StrictMode
+    value: 'true'
+  - key: performance-unnecessary-value-param.AllowedTypes
+    value: ''
+
+  # Readability options
+  - key: readability-function-size.LineThreshold
+    value: '80'
+  - key: readability-function-size.StatementThreshold
+    value: '50'
+  - key: readability-function-size.BranchThreshold
+    value: '20'
+  - key: readability-function-size.ParameterThreshold
+    value: '8'
+  - key: readability-function-size.NestingThreshold
+    value: '4'
+  - key: readability-function-size.VariableThreshold
+    value: '20'
+
+  # Bugprone options
+  - key: bugprone-argument-comment.StrictMode
+    value: 'true'
+  - key: bugprone-assert-side-effect.AssertMacros
+    value: 'assert,ASSERT'
+  - key: bugprone-string-constructor.WarnOnLargeLength
+    value: 'true'
+  - key: bugprone-string-constructor.LargeLengthThreshold
+    value: '8388608'
+
+  # Misc options
+  # include-cleaner names the header that declares a symbol, and three times
+  # here it names one nobody writes: glibc puts the POSIX signal names in bits/
+  # and asks for <signal.h> where <csignal> is the C++ spelling; glibc's
+  # <poll.h> is one line including <sys/poll.h>, so the check asks for the
+  # System V compatibility header rather than the POSIX one that forwards to it;
+  # and Qt's <QLabel> is a forwarding header that some versions of the check see
+  # through to qlabel.h. Narrowing what it asks about is better than switching
+  # it off, and better than a NOLINT. docs/coding-style.md has the measurement.
+  - key: misc-include-cleaner.IgnoreHeaders
+    value: 'bits/.*;.*signal\.h;.*sys/poll\.h;.*/Qt[A-Z][A-Za-z]*/.*'
+  - key: misc-throw-by-value-catch-by-reference.CheckThrowTemporaries
+    value: 'true'
+  # Headers should contain declarations only - enforce strict separation
+  - key: misc-definitions-in-headers.UseHeaderFileExtension
+    value: 'true'
+  - key: misc-definitions-in-headers.HeaderFileExtensions
+    value: 'h,hpp,hxx'
+  - key: misc-definitions-in-headers.ImplementationFileExtensions
+    value: 'c,cc,cpp,cxx'
+
+# Which headers get analysed. include/ and src/, and nothing else. clang-tidy
+# reports a finding in a header only when that header matches this expression,
+# so a public header left out of it is a public header nothing checks - which is
+# what src/ alone meant here until it was measured. Generated headers and
+# fetched dependencies live outside both directories and stay out.
+HeaderFilterRegex: '^.*/(include|src)/.*\.(h|hpp)$'
+
+# Fixes are formatted with this project's .clang-format rather than clang-tidy's
+# own idea of layout.
+FormatStyle: file
+
+SystemHeaders: false

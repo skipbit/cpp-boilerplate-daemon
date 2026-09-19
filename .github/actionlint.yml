@@ -1,0 +1,10 @@
+# actionlint carries a built-in list of runner labels, and that list is a
+# snapshot taken when the linter was released. ubuntu-26.04 runners exist and
+# the matrix in build-and-test.yml uses them, so without this entry a linter
+# that is out of date fails a workflow that is not.
+#
+# The cost of declaring a label here is that a typo in it stops being an error.
+# Remove the entry once your actionlint knows the label.
+self-hosted-runner:
+  labels:
+    - ubuntu-26.04

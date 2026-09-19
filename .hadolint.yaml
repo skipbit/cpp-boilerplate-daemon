@@ -1,0 +1,4 @@
+# DL3008 asks that every apt package name a version. Why this project does not,
+# and what it pins instead: docs/toolchain.md.
+ignored:
+  - DL3008
