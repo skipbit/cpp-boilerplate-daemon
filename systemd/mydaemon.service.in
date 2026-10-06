@@ -1,0 +1,28 @@
+# Generated from systemd/mydaemon.service.in by CMake, and installed with the
+# program. Edit the template rather than the copy.
+
+[Unit]
+Description=@PROJECT_DESCRIPTION@
+Documentation=@PROJECT_HOMEPAGE_URL@
+
+[Service]
+# exec, not simple: systemd waits until the binary has actually been executed
+# before calling the service started, so an unrunnable one is a failed start
+# rather than a service reported active and gone.
+Type=exec
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/@PROJECT_NAME@
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+# What the program writes to standard error is what journalctl shows. That is
+# why it writes lines and owns no log file: rotation, timestamps and retention
+# already belong to something else.
+
+# Nothing here needs any of this, so nothing here is allowed any of it.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
