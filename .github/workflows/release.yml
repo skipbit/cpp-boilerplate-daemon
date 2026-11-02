@@ -1,0 +1,114 @@
+# A release is a git tag. This workflow is what the tag causes.
+#
+# Nothing here decides a version number: scripts/release.sh already refused to
+# create a tag that disagrees with project(VERSION), and the first job checks it
+# again, because a tag can also be created by hand or by the web interface.
+#
+# The full gate runs before anything is published. A release that skipped the
+# checks main has to pass is a release that says less than main does.
+#
+# Note for anyone comparing this with older examples: actions/create-release and
+# actions/upload-release-asset are archived repositories whose last commit is
+# from March 2021. The gh CLI is preinstalled on the runners and does both.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# `shell: bash` is not the shell a run step gets by default. The default is
+# `bash -e`; naming it explicitly gets `bash -eo pipefail`, so a command that
+# fails on the left of a pipe fails the step instead of being overwritten by
+# whatever came after it. Set once for the workflow rather than per step,
+# because the flags belong to the shell, not to whichever commands happen to be
+# in it today - a step added next month gets them without anybody remembering.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  version:
+    name: the tag matches the source
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./scripts/release.sh --check "${GITHUB_REF_NAME}"
+
+  verify:
+    needs: version
+    uses: ./.github/workflows/build-and-test.yml
+
+  # main and every pull request run this one as well. A release that runs less
+  # than they do was checked less than the commit it was cut from, so a gate
+  # added to main-check.yml belongs here in the same change.
+  verify-presets:
+    needs: version
+    uses: ./.github/workflows/preset-check.yml
+
+  publish:
+    needs: [verify, verify-presets]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # creating a release writes to the repository
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build the pinned image
+        uses: docker/build-push-action@v7
+        with:
+          context: .devcontainer
+          load: true
+          tags: toolchain:ci
+          cache-from: type=gha
+
+      # Named after the repository rather than after a project written into this
+      # file. This workflow is copied into every project that starts from a
+      # template, and the name of the first one is not the name of any of the
+      # others.
+      - name: Name the archive
+        run: echo "ARCHIVE=${GITHUB_REPOSITORY##*/}-${GITHUB_REF_NAME}-linux-x64" >> "$GITHUB_ENV"
+
+      # Built in the pinned image so that the archive is reproducible from the
+      # Dockerfile in this repository rather than from whatever the runner had.
+      #
+      # The SBOM option is read out of CMakeLists.txt for the same reason the
+      # name is: it is named after the project, and some projects install
+      # something install(SBOM) cannot describe and so declare no option at all.
+      - name: Build and install into a staging directory
+        run: |
+          mkdir -p stage
+          sbom=$(grep -oE '[A-Za-z0-9_]+_GENERATE_SBOM' CMakeLists.txt | head -1 || true)
+          echo "SBOM option: ${sbom:-none declared in CMakeLists.txt}"
+          docker run --rm -v "$PWD":/src:ro -v "$PWD/stage":/stage \
+            -e SBOM="$sbom" -e ARCHIVE="$ARCHIVE" toolchain:ci bash -euxo pipefail -c '
+            cmake -S /src -B /tmp/build -G Ninja \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DCPPBP_WARNINGS_AS_ERRORS=ON \
+              ${SBOM:+"-D${SBOM}=ON"}
+            cmake --build /tmp/build
+            # --no-tests=error: a release that ran no tests must not be a
+            # release that passed them.
+            ctest --test-dir /tmp/build --output-on-failure --no-tests=error
+            cmake --install /tmp/build --prefix "/stage/${ARCHIVE}"
+            chown -R $(stat -c "%u:%g" /stage) /stage
+          '
+
+      - name: Archive it
+        run: tar -czf "${ARCHIVE}.tar.gz" -C stage .
+
+      # --generate-notes writes the changelog from the commits and pull requests
+      # since the previous tag, so that a release nobody wrote notes for still
+      # says what changed.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            "${ARCHIVE}.tar.gz"

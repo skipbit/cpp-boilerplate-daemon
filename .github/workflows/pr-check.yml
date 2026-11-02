@@ -1,0 +1,35 @@
+# Guards the main branch against changes that do not build, test or lint.
+#
+# Every pull request, whatever its base. A base filter here reads as a narrowing
+# and behaves as a hole: a pull request against a branch it does not list runs
+# no job at all, and GitHub reports that as mergeable and clean rather than as
+# unchecked - so a stack of pull requests, or a release branch you merge into
+# before main, is silently unverified while looking green.
+#
+# What that costs you is a full run on pull requests between two of your own
+# branches. Free on a public repository, billed minutes on a private one. If you
+# would rather pay less than check everything, put the filter back:
+#
+#   on:
+#     pull_request:
+#       branches: [main]
+#
+# knowing what it buys: pull requests against anything else stop being checked,
+# and still look green.
+name: pr check
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/build-and-test.yml
+
+  # The presets, which build-and-test.yml does not type: it sets the flags
+  # by hand so it can vary the compiler. Separate job, so a failure says which
+  # of the two is broken.
+  verify-presets:
+    uses: ./.github/workflows/preset-check.yml

@@ -1,0 +1,113 @@
+# Reusable: types the three lines the README tells a newcomer to type, once for
+# every preset the project declares.
+#
+# build-and-test.yml never types them. It spells the flags out by hand because
+# it has to vary the compiler and the standard library, and a preset fixes both.
+# That leaves the documented way in as the one entrance nothing walks through,
+# and a preset nothing runs is a preset that stops working without saying so.
+#
+# The list is read out of cmake rather than written here. A preset added to
+# CMakePresets.json and forgotten in the CI is the exact failure this file
+# exists to catch, and a list written here is a second place to forget it. For
+# the same reason there is no exclusion list: nightly-sanitizer.yml builds asan
+# and tsan too, and building them twice costs less than a list that grows.
+name: preset check
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+# `shell: bash` is not the shell a run step gets by default. The default is
+# `bash -e`; naming it explicitly gets `bash -eo pipefail`, so a command that
+# fails on the left of a pipe fails the step instead of being overwritten by
+# whatever came after it. Set once for the workflow rather than per step,
+# because the flags belong to the shell, not to whichever commands happen to be
+# in it today - a step added next month gets them without anybody remembering.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  presets:
+    name: every preset, end to end
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      # Out of Ubuntu's own archive, no extra repositories, because the claim
+      # under test is that these presets work on the machine somebody already
+      # has. clang and clang-tidy are what the tidy preset asks for, libc++ what
+      # clang-libc++ does; a preset that needs something else fails here, which
+      # is the job doing its work rather than a gap in it.
+      # Qt is asked for out of CMakeLists.txt rather than written here: this
+      # file is the same in every project that starts from a template, and one
+      # with no interface should not wait for a Qt it never uses.
+      - name: Install what the presets ask for
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build clang clang-tidy libc++-dev libc++abi-dev
+          if grep -q 'find_package(Qt6' CMakeLists.txt; then
+            sudo apt-get install -y --no-install-recommends \
+              qt6-base-dev \
+              qt6-declarative-dev \
+              qml6-module-qtqml \
+              qml6-module-qtqml-models \
+              qml6-module-qtqml-workerscript \
+              qml6-module-qtquick \
+              qml6-module-qtquick-controls \
+              qml6-module-qtquick-layouts \
+              qml6-module-qtquick-templates \
+              qml6-module-qtquick-window
+          fi
+
+      - name: Record what this job is actually building with
+        run: |
+          cmake --version | head -1
+          clang++ --version | head -1
+          clang-tidy --version | sed -n 2p
+
+      - name: Configure, build and test every preset
+        run: |
+          set -euo pipefail
+
+          # Asked of cmake rather than read out of CMakePresets.json: cmake
+          # resolves inheritance and includes and drops the hidden entries, so
+          # this is the list somebody choosing a preset is choosing from.
+          names() { cmake --list-presets="$1" | sed -n 's/^ *"\([^"]*\)".*/\1/p'; }
+
+          configure_presets=$(names configure)
+          test_presets=$(names test)
+
+          # Every name goes into the summary before the first one is built, so
+          # that a job which dies halfway is read as a job which died halfway
+          # rather than as a project with fewer presets than it has.
+          {
+            echo "Presets declared: $(tr '\n' ' ' <<< "$configure_presets")"
+            echo
+            echo "| preset | ctest |"
+            echo "| --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          while IFS= read -r preset; do
+            echo "::group::$preset"
+            cmake --preset "$preset"
+            cmake --build --preset "$preset"
+
+            # A configure preset does not have to have tests to run: tidy has
+            # said everything it has to say by the time the build finishes.
+            # Which ones do is asked of cmake as well, so that a test preset
+            # added later starts running without anybody editing this.
+            if printf '%s\n' "$test_presets" | grep -qxF -- "$preset"; then
+              QT_QPA_PLATFORM=offscreen ctest --preset "$preset"
+              ran="run"
+            else
+              echo "no test preset named \"$preset\"; nothing to run"
+              ran="no test preset"
+            fi
+
+            echo "::endgroup::"
+            printf '| %s | %s |\n' "$preset" "$ran" >> "$GITHUB_STEP_SUMMARY"
+          done <<< "$configure_presets"
